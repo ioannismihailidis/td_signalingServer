@@ -1,8 +1,10 @@
 import { WebSocketServer, WebSocket } from 'ws';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
+import http from 'node:http';
 import https from 'node:https';
-import { URL } from 'node:url';
+import path from 'node:path';
+import { URL, fileURLToPath } from 'node:url';
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -192,30 +194,53 @@ function handleConnection(ws, req) {
 }
 
 // ---------------------------------------------------------------------------
+// HTTP handler — serves client.html at /
+// ---------------------------------------------------------------------------
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const CLIENT_HTML_PATH = path.join(__dirname, '..', 'test', 'client.html');
+
+function handleHttpRequest(req, res) {
+  if (req.method === 'GET' && (req.url === '/' || req.url === '/index.html')) {
+    fs.readFile(CLIENT_HTML_PATH, (err, data) => {
+      if (err) {
+        res.writeHead(404, { 'Content-Type': 'text/plain' });
+        res.end('client.html not found');
+        return;
+      }
+      res.writeHead(200, { 'Content-Type': 'text/html' });
+      res.end(data);
+    });
+  } else {
+    res.writeHead(404, { 'Content-Type': 'text/plain' });
+    res.end('Not Found');
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Server startup
 // ---------------------------------------------------------------------------
 
-let wss;
+let server;
 
 if (SSL_CERT && SSL_KEY) {
-  const server = https.createServer({
+  server = https.createServer({
     cert: fs.readFileSync(SSL_CERT),
     key: fs.readFileSync(SSL_KEY),
-  });
-  wss = new WebSocketServer({ server });
-  server.listen(PORT, () => {
-    console.log(`[server] TouchDesigner Signaling Server v${API_VERSION}`);
-    console.log(`[server] Listening on wss://0.0.0.0:${PORT}`);
-    console.log(`[server] Passthrough: ${PASSTHROUGH}`);
-  });
+  }, handleHttpRequest);
 } else {
-  wss = new WebSocketServer({ port: PORT });
-  wss.on('listening', () => {
-    console.log(`[server] TouchDesigner Signaling Server v${API_VERSION}`);
-    console.log(`[server] Listening on ws://0.0.0.0:${PORT}`);
-    console.log(`[server] Passthrough: ${PASSTHROUGH}`);
-  });
+  server = http.createServer(handleHttpRequest);
 }
+
+const wss = new WebSocketServer({ server });
+
+server.listen(PORT, () => {
+  const proto = SSL_CERT ? 'wss' : 'ws';
+  console.log(`[server] TouchDesigner Signaling Server v${API_VERSION}`);
+  console.log(`[server] Listening on ${proto}://0.0.0.0:${PORT}`);
+  console.log(`[server] Client UI available at http${SSL_CERT ? 's' : ''}://0.0.0.0:${PORT}/`);
+  console.log(`[server] Passthrough: ${PASSTHROUGH}`);
+});
 
 wss.on('connection', handleConnection);
 
