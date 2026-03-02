@@ -100,8 +100,8 @@ Every message follows this structure:
   "metadata": {
     "apiVersion": "1.0.1",
     "compVersion": "1.0.0",
-    "compOrigin": "td-signal-server",
-    "projectName": "td-signal-server"
+    "compOrigin": "td-signaling-server",
+    "projectName": "td-signaling-server"
   },
   "signalingType": "ClientEntered",
   "content": { ... }
