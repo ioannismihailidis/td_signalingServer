@@ -1,11 +1,11 @@
-# TD Signal Server
+# TD Signaling Server
 
 A Node.js WebSocket signaling server for TouchDesigner WebRTC connections. Implements the [TouchDesigner Signaling API v1.0.1](https://github.com/TouchDesigner/SignalingAPI).
 
 ## Project Structure
 
 ```
-td_signalServer/
+td_signalingServer/
   src/
     server.mjs          # Signaling server
   test/
