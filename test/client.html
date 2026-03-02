@@ -1,0 +1,540 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>TD Signal Client</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { font-family: monospace; background: #1a1a1a; color: #ccc; padding: 20px; }
+    h1 { font-size: 16px; margin-bottom: 12px; color: #fff; }
+    #status { padding: 6px 10px; border-radius: 4px; display: inline-block; margin-bottom: 16px; font-size: 13px; }
+    .disconnected { background: #442222; color: #ff6666; }
+    .connected { background: #224422; color: #66ff66; }
+    .streaming { background: #222244; color: #6666ff; }
+
+    #video-container {
+      background: #000;
+      border: 1px solid #333;
+      border-radius: 4px;
+      width: 100%;
+      max-width: 960px;
+      aspect-ratio: 16/9;
+      position: relative;
+      overflow: hidden;
+      margin-bottom: 16px;
+    }
+    video {
+      width: 100%;
+      height: 100%;
+      object-fit: contain;
+    }
+    #no-stream {
+      position: absolute;
+      inset: 0;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      color: #555;
+      font-size: 14px;
+    }
+
+    #controls { margin-bottom: 16px; display: flex; gap: 8px; align-items: center; }
+    label { font-size: 13px; }
+    input { background: #2a2a2a; border: 1px solid #444; color: #ccc; padding: 4px 8px;
+            border-radius: 3px; font-family: monospace; font-size: 13px; }
+    input#server-url { width: 300px; }
+    button {
+      background: #333; border: 1px solid #555; color: #ccc; padding: 5px 14px;
+      border-radius: 3px; cursor: pointer; font-family: monospace; font-size: 13px;
+    }
+    button:hover { background: #444; }
+    button.active { background: #225522; border-color: #66ff66; color: #66ff66; }
+
+    #log {
+      background: #111; border: 1px solid #333; border-radius: 4px; padding: 10px;
+      height: 200px; overflow-y: auto; font-size: 12px; line-height: 1.6;
+      max-width: 960px;
+    }
+    .log-info { color: #88aaff; }
+    .log-warn { color: #ffaa44; }
+    .log-error { color: #ff6666; }
+    .log-msg { color: #888; }
+
+    #clients-panel {
+      margin-bottom: 16px; max-width: 960px;
+    }
+    #clients-panel h2 { font-size: 13px; margin-bottom: 6px; color: #aaa; }
+    #clients-list {
+      background: #111; border: 1px solid #333; border-radius: 4px; padding: 8px;
+      font-size: 12px; min-height: 30px;
+    }
+    .client-entry { padding: 2px 0; }
+    .client-entry.self { color: #66ff66; }
+    .client-entry.target { color: #88aaff; font-weight: bold; }
+  </style>
+</head>
+<body>
+  <h1>TouchDesigner Signal Client</h1>
+
+  <div id="controls">
+    <label>Server:</label>
+    <input id="server-url" type="text" value="ws://localhost:9980/" />
+    <button id="btn-connect" onclick="toggleConnection()">Connect</button>
+    <button id="btn-unmute" onclick="toggleMute()" style="display:none">Unmute Audio</button>
+    <button id="btn-fullscreen" onclick="toggleFullscreen()" style="display:none">Fullscreen</button>
+  </div>
+
+  <div id="status" class="disconnected">Disconnected</div>
+
+  <div id="clients-panel">
+    <h2>Connected Clients</h2>
+    <div id="clients-list">-</div>
+  </div>
+
+  <div id="video-container">
+    <div id="no-stream">Waiting for stream...</div>
+    <video id="video" autoplay playsinline muted></video>
+  </div>
+
+  <div id="log"></div>
+
+  <script>
+    // -----------------------------------------------------------------------
+    // State
+    // -----------------------------------------------------------------------
+
+    let ws = null;
+    let selfClient = null;
+    let knownClients = new Map();       // address -> client object
+    let peerConnections = new Map();    // address -> RTCPeerConnection
+    let remoteStream = null;            // pre-initialized MediaStream
+
+    // Perfect Negotiation flags
+    let makingOffer = false;
+    let polite = true;
+
+    const API_VERSION = '1.0.1';
+    const metadata = {
+      apiVersion: API_VERSION,
+      compVersion: '1.0.0',
+      compOrigin: window.location.href,
+      projectName: 'td-web-client',
+    };
+
+    const iceServers = [
+      { urls: 'stun:stun.l.google.com:19302' },
+      { urls: 'stun:stun1.l.google.com:19302' },
+    ];
+
+    // -----------------------------------------------------------------------
+    // Logging
+    // -----------------------------------------------------------------------
+
+    function log(text, cls = 'log-msg') {
+      const el = document.getElementById('log');
+      const line = document.createElement('div');
+      line.className = cls;
+      const ts = new Date().toLocaleTimeString();
+      line.textContent = `[${ts}] ${text}`;
+      el.appendChild(line);
+      el.scrollTop = el.scrollHeight;
+    }
+
+    // -----------------------------------------------------------------------
+    // UI updates
+    // -----------------------------------------------------------------------
+
+    function setStatus(text, cls) {
+      const el = document.getElementById('status');
+      el.textContent = text;
+      el.className = cls;
+    }
+
+    function renderClients() {
+      const el = document.getElementById('clients-list');
+      el.innerHTML = '';
+
+      if (selfClient) {
+        const div = document.createElement('div');
+        div.className = 'client-entry self';
+        div.textContent = `[you] ${selfClient.address} (${selfClient.id})`;
+        el.appendChild(div);
+      }
+
+      if (knownClients.size === 0 && !selfClient) {
+        el.textContent = '-';
+        return;
+      }
+
+      for (const [addr, client] of knownClients) {
+        const div = document.createElement('div');
+        const hasPC = peerConnections.has(addr);
+        div.className = 'client-entry' + (hasPC ? ' target' : '');
+        const label = hasPC ? '[target] ' : '';
+        div.textContent = `${label}${client.address} (${client.id})`;
+        el.appendChild(div);
+      }
+    }
+
+    // -----------------------------------------------------------------------
+    // WebSocket connection
+    // -----------------------------------------------------------------------
+
+    function toggleConnection() {
+      if (ws && ws.readyState <= WebSocket.OPEN) {
+        ws.close();
+      } else {
+        connect();
+      }
+    }
+
+    function connect() {
+      const url = document.getElementById('server-url').value;
+      log(`Connecting to ${url}...`, 'log-info');
+
+      ws = new WebSocket(url);
+
+      ws.onopen = () => {
+        log('WebSocket connected', 'log-info');
+        setStatus('Connected', 'connected');
+        document.getElementById('btn-connect').textContent = 'Disconnect';
+        document.getElementById('btn-connect').classList.add('active');
+      };
+
+      ws.onclose = () => {
+        log('WebSocket closed', 'log-warn');
+        setStatus('Disconnected', 'disconnected');
+        document.getElementById('btn-connect').textContent = 'Connect';
+        document.getElementById('btn-connect').classList.remove('active');
+        cleanup();
+      };
+
+      ws.onerror = () => {
+        log('WebSocket error', 'log-error');
+      };
+
+      ws.onmessage = (event) => {
+        let msg;
+        try {
+          msg = JSON.parse(event.data);
+        } catch {
+          log('Invalid JSON received', 'log-error');
+          return;
+        }
+        handleSignalingMessage(msg);
+      };
+    }
+
+    function sendSignaling(signalingType, target, content) {
+      if (!ws || ws.readyState !== WebSocket.OPEN) return;
+      const msg = { metadata, signalingType, target, content };
+      ws.send(JSON.stringify(msg));
+    }
+
+    function toggleFullscreen() {
+      const container = document.getElementById('video-container');
+      if (!document.fullscreenElement) {
+        container.requestFullscreen();
+      } else {
+        document.exitFullscreen();
+      }
+    }
+
+    function toggleMute() {
+      const video = document.getElementById('video');
+      const btn = document.getElementById('btn-unmute');
+      video.muted = !video.muted;
+      btn.textContent = video.muted ? 'Unmute Audio' : 'Mute Audio';
+      log(`Audio ${video.muted ? 'muted' : 'unmuted'}`, 'log-info');
+    }
+
+    // -----------------------------------------------------------------------
+    // Signaling message handler
+    // -----------------------------------------------------------------------
+
+    function handleSignalingMessage(msg) {
+      const { signalingType } = msg;
+
+      switch (signalingType) {
+        case 'ClientEntered':
+          selfClient = msg.content.self;
+          log(`Registered as ${selfClient.address} (${selfClient.id})`, 'log-info');
+          renderClients();
+          break;
+
+        case 'Clients':
+          for (const client of msg.content.clients) {
+            knownClients.set(client.address, client);
+          }
+          log(`Received client list: ${msg.content.clients.length} peer(s)`, 'log-info');
+          renderClients();
+          connectToBroadcasters(msg.content.clients);
+          break;
+
+        case 'ClientEnter':
+          knownClients.set(msg.content.client.address, msg.content.client);
+          log(`Client joined: ${msg.content.client.address}`, 'log-info');
+          renderClients();
+          break;
+
+        case 'ClientExit': {
+          const addr = msg.content.client.address;
+          knownClients.delete(addr);
+          log(`Client left: ${addr}`, 'log-warn');
+          closePeerConnection(addr);
+          renderClients();
+          break;
+        }
+
+        case 'Offer':
+          log(`Offer from ${msg.sender}`, 'log-info');
+          handleOffer(msg.content.sdp, msg.sender);
+          break;
+
+        case 'Answer':
+          log(`Answer from ${msg.sender}`, 'log-info');
+          handleAnswer(msg.content.sdp, msg.sender);
+          break;
+
+        case 'Ice':
+          handleIce(msg.content, msg.sender);
+          break;
+
+        default:
+          log(`Unknown type: ${signalingType}`, 'log-msg');
+      }
+    }
+
+    // -----------------------------------------------------------------------
+    // WebRTC — following Schwarz_VR_WebPreview patterns
+    // -----------------------------------------------------------------------
+
+    function connectToBroadcasters(clients) {
+      for (const client of clients) {
+        if (client.id === selfClient?.id || client.address === selfClient?.address) continue;
+        if (peerConnections.has(client.address)) continue;
+
+        log(`Initiating peer connection to: ${client.address}`, 'log-info');
+
+        // Determine politeness (newer peer is polite)
+        const myTime = selfClient?.properties?.timeJoined || Date.now();
+        const theirTime = client.properties?.timeJoined || 0;
+        polite = myTime > theirTime;
+
+        // Create peer connection and add recvonly transceivers
+        // This triggers onnegotiationneeded which sends the offer
+        const pc = createPeerConnection(client.address);
+        pc.addTransceiver('video', { direction: 'recvonly' });
+        pc.addTransceiver('audio', { direction: 'recvonly' });
+        log(`Added recvonly transceivers, negotiation will fire`, 'log-info');
+      }
+      renderClients();
+    }
+
+    function createPeerConnection(peerId) {
+      if (peerConnections.has(peerId)) {
+        return peerConnections.get(peerId);
+      }
+
+      // Pre-initialize remote stream and attach to video element
+      if (!remoteStream) {
+        remoteStream = new MediaStream();
+        const video = document.getElementById('video');
+        video.srcObject = remoteStream;
+        log('Created remote MediaStream and attached to video element', 'log-info');
+      }
+
+      const pc = new RTCPeerConnection({ iceServers });
+
+      // Track handler — add to pre-initialized stream
+      pc.ontrack = (event) => {
+        log(`Track received: ${event.track.kind} (id=${event.track.id}, state=${event.track.readyState})`, 'log-info');
+        remoteStream.addTrack(event.track);
+        const tracks = remoteStream.getTracks();
+        log(`Remote stream now has ${tracks.length} track(s): ${tracks.map(t => t.kind).join(', ')}`, 'log-info');
+        document.getElementById('no-stream').style.display = 'none';
+        document.getElementById('btn-fullscreen').style.display = '';
+        document.getElementById('btn-unmute').style.display = '';
+        setStatus('Streaming', 'streaming');
+      };
+
+      // ICE candidates
+      pc.onicecandidate = (event) => {
+        if (event.candidate) {
+          sendSignaling('Ice', peerId, {
+            sdpCandidate: event.candidate.candidate,
+            sdpMLineIndex: event.candidate.sdpMLineIndex,
+            sdpMid: event.candidate.sdpMid,
+          });
+        }
+      };
+
+      // Perfect Negotiation — onnegotiationneeded creates the offer
+      pc.onnegotiationneeded = async () => {
+        if (makingOffer || pc.signalingState !== 'stable') return;
+
+        try {
+          makingOffer = true;
+          await pc.setLocalDescription(); // implicit offer
+          sendSignaling('Offer', peerId, { sdp: pc.localDescription.sdp });
+          log(`Sent Offer to ${peerId}`, 'log-info');
+        } catch (err) {
+          log(`Offer error: ${err.message}`, 'log-error');
+        } finally {
+          makingOffer = false;
+        }
+      };
+
+      // State logging
+      pc.oniceconnectionstatechange = () => {
+        log(`ICE state: ${pc.iceConnectionState}`, 'log-msg');
+      };
+
+      pc.onconnectionstatechange = () => {
+        log(`Connection state: ${pc.connectionState}`, 'log-msg');
+        if (pc.connectionState === 'connected') {
+          log('Peer connection established!', 'log-info');
+        }
+        if (['disconnected', 'failed', 'closed'].includes(pc.connectionState)) {
+          closePeerConnection(peerId);
+        }
+      };
+
+      peerConnections.set(peerId, pc);
+      return pc;
+    }
+
+    // Perfect Negotiation — handle incoming offer
+    async function handleOffer(sdp, senderId) {
+      let pc = peerConnections.get(senderId);
+      if (!pc) {
+        pc = createPeerConnection(senderId);
+      }
+
+      // Offer collision detection
+      const collision = pc.signalingState !== 'stable' || makingOffer;
+      if (collision && !polite) {
+        log('Offer collision — ignoring (impolite)', 'log-warn');
+        return;
+      }
+
+      try {
+        log(`Signaling state before setRemoteDescription: ${pc.signalingState}`, 'log-msg');
+        await pc.setRemoteDescription(new RTCSessionDescription({ type: 'offer', sdp }));
+        log(`Signaling state after setRemoteDescription: ${pc.signalingState}`, 'log-msg');
+
+        // Log what the remote offer contains
+        const receivers = pc.getReceivers();
+        log(`Receivers after remote offer: ${receivers.map(r => r.track?.kind || 'none').join(', ')}`, 'log-info');
+
+        // Sync any new tracks from receivers into the remote stream
+        // (ontrack may not fire for reused transceivers during renegotiation)
+        if (remoteStream) {
+          let added = false;
+          const existingTrackIds = new Set(remoteStream.getTracks().map(t => t.id));
+          for (const receiver of pc.getReceivers()) {
+            if (receiver.track && !existingTrackIds.has(receiver.track.id)) {
+              const track = receiver.track;
+              log(`Adding missed ${track.kind} track (enabled=${track.enabled}, muted=${track.muted})`, 'log-info');
+              remoteStream.addTrack(track);
+              added = true;
+
+              // Track may be muted until ICE completes for this media
+              if (track.muted) {
+                track.addEventListener('unmute', () => {
+                  log(`Track ${track.kind} unmuted — media is now flowing`, 'log-info');
+                  const video = document.getElementById('video');
+                  video.srcObject = remoteStream;
+                  video.play().catch(() => {});
+                }, { once: true });
+              }
+            }
+          }
+          const tracks = remoteStream.getTracks();
+          log(`Remote stream now has ${tracks.length} track(s): ${tracks.map(t => t.kind).join(', ')}`, 'log-info');
+
+          // Reassign srcObject and replay to pick up newly added tracks
+          if (added) {
+            const video = document.getElementById('video');
+            video.srcObject = remoteStream;
+            video.play().catch(() => {});
+            log('Reassigned srcObject to pick up new tracks', 'log-info');
+          }
+
+          if (tracks.length > 0) {
+            document.getElementById('no-stream').style.display = 'none';
+            document.getElementById('btn-fullscreen').style.display = '';
+            document.getElementById('btn-unmute').style.display = '';
+            setStatus('Streaming', 'streaming');
+          }
+        }
+
+        const answer = await pc.createAnswer();
+        await pc.setLocalDescription(answer);
+        sendSignaling('Answer', senderId, { sdp: answer.sdp });
+        log('Sent Answer', 'log-info');
+      } catch (err) {
+        log(`Answer error: ${err.message}`, 'log-error');
+      }
+    }
+
+    async function handleAnswer(sdp, senderId) {
+      const pc = peerConnections.get(senderId);
+      if (!pc) return;
+      try {
+        await pc.setRemoteDescription(new RTCSessionDescription({ type: 'answer', sdp }));
+        log('Remote description set', 'log-info');
+      } catch (err) {
+        log(`Answer apply error: ${err.message}`, 'log-error');
+      }
+    }
+
+    async function handleIce(content, senderId) {
+      const pc = peerConnections.get(senderId);
+      if (!pc) return;
+      try {
+        await pc.addIceCandidate(new RTCIceCandidate({
+          candidate: content.sdpCandidate,
+          sdpMLineIndex: content.sdpMLineIndex,
+          sdpMid: content.sdpMid,
+        }));
+      } catch (err) {
+        log(`ICE error: ${err.message}`, 'log-error');
+      }
+    }
+
+    function closePeerConnection(peerId) {
+      const pc = peerConnections.get(peerId);
+      if (pc) {
+        pc.close();
+        peerConnections.delete(peerId);
+        log(`Closed peer connection: ${peerId}`, 'log-warn');
+      }
+      if (peerConnections.size === 0) {
+        remoteStream = null;
+        const video = document.getElementById('video');
+        video.srcObject = null;
+        document.getElementById('no-stream').style.display = 'flex';
+        setStatus('Connected', 'connected');
+      }
+      renderClients();
+    }
+
+    function cleanup() {
+      peerConnections.forEach((pc, id) => {
+        pc.close();
+      });
+      peerConnections.clear();
+      remoteStream = null;
+      const video = document.getElementById('video');
+      video.srcObject = null;
+      document.getElementById('no-stream').style.display = 'flex';
+      selfClient = null;
+      knownClients.clear();
+      makingOffer = false;
+      renderClients();
+    }
+  </script>
+</body>
+</html>

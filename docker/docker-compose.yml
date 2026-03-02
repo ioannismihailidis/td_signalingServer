@@ -1,0 +1,16 @@
+services:
+  signaling-server:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    ports:
+      - "9980:9980"
+    environment:
+      - PORT=9980
+      - PASSTHROUGH=false
+      # Optional SSL — uncomment and mount cert files to enable
+      # - SSL_CERT=/certs/cert.pem
+      # - SSL_KEY=/certs/key.pem
+    # volumes:
+    #   - ./certs:/certs:ro
+    restart: unless-stopped

@@ -1,0 +1,13 @@
+{
+  "name": "td-signal-server",
+  "version": "1.0.1",
+  "description": "WebSocket signaling server for TouchDesigner WebRTC connections",
+  "type": "module",
+  "main": "src/server.mjs",
+  "scripts": {
+    "start": "node src/server.mjs"
+  },
+  "dependencies": {
+    "ws": "^8.19.0"
+  }
+}
